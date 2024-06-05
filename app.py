@@ -46,8 +46,9 @@ def index():
         f"msg: {version['msg']}<br>"
     )
 
-    # Construct HTML for clickable hyperlink
-    html_output = f'{version_data}Login Image:<a href="{login_sorted[0][0]}">{login_sorted[0][0]}</a><br>'
+    # Construct HTML to display version information and login image
+    html_output = f'{version_data}Login Image:<br>'
+    html_output += f'<img src="{login_sorted[0][0]}" alt="Login Image" style="max-width: 500px;">'
     
     return html_output
 
