@@ -51,7 +51,7 @@ def index():
     html_output += f'<img src="{login_sorted[0][0]}" alt="Login Image" style="max-width: 500px;">'
     html_output += '''
         <form action="/getmainScenePicture" method="post">
-            <button type="submit">getmainScenePicture</button>
+            <button type="submit" style="width: 300px; height: 50px; font-size: 20px; padding: 10px 20px;">Get Main Scene Pictures</button>
         </form>
     '''
     return html_output
