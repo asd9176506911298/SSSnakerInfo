@@ -49,6 +49,46 @@ def index():
     # Construct HTML to display version information and login image
     html_output = f'{version_data}Login Image:<br>'
     html_output += f'<img src="{login_sorted[0][0]}" alt="Login Image" style="max-width: 500px;">'
+    html_output += '''
+        <form action="/getmainScenePicture" method="post">
+            <button type="submit">getmainScenePicture</button>
+        </form>
+    '''
+    return html_output
+
+@app.route('/getmainScenePicture', methods=['POST'])
+def getmainScenePicture():
+    URL = "https://res.snakesvc.com/assets/res.json"
+    assetsUrl = 'https://res.snakesvc.com/assets'
+
+    response = requests.get(URL)
+
+    mainScene = []
+
+     # Open the zip file from the response content
+    with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
+        # Read the JSON file within the zip archive
+        with zip_file.open('res.json') as json_file:
+            content = json_file.read()
+            res = json.loads(content.decode("utf-8"))
+            print('downloaded')
+            for i in res['files']:
+                if i.endswith('.png'):
+                    if i.startswith('mainScene'):
+                        md5 = res['files'][i]['md5']
+                        size = res['files'][i]['size']
+                        path_Dot = i.split('.')
+                        imageName = path_Dot[0] + '.' + md5 + '.' + path_Dot[1]
+                        filePath = assetsUrl + '/' + imageName
+                        if i.startswith('mainScene'):
+                            mainScene.append((filePath, size))
+        
+    mainScene_sorted = sorted(mainScene, key=lambda x: x[1], reverse=True)
+    # Construct HTML to display images in multiple rows
+    html_output = "<div style='display: flex; flex-wrap: wrap;'>"
+    for i in mainScene_sorted:
+        html_output += f'<div style="flex: 1 1 100px; margin: 5px;"><img src="{i[0]}" style="max-width: 100%;"></div>'
+    html_output += "</div>"
     
     return html_output
 
