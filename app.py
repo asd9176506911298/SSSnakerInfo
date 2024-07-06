@@ -231,7 +231,7 @@ def query_short_id():
             <button type="submit" style="width: 300px; height: 50px; font-size: 20px; padding: 10px 20px;">Get Current Version</button>
         </form>
         <form action="/" method="get">
-            <button type="submit" style="width: 300px; height: 50px; font-size: 20px; padding: 10px 20px;">Cdn Version(UnPublish Version)</button>
+            <button type="submit" style="width: 500px; height: 50px; font-size: 20px; padding: 10px 20px;">Cdn Version(UnPublish Version)</button>
         </form>
         <form action="/query" method="post">
             <input type="text" name="short_id" placeholder="Enter short_id" required>
