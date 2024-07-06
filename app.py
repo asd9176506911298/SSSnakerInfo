@@ -121,7 +121,8 @@ def currentMobileVersion():
     )
 
     # Construct HTML to display version information and login image
-    html_output = f'{version_data}Login Image:<br>'
+    html_output = f'<h1 style="font-size: 24px;">Current Mobile Version</h1>'
+    html_output += f'{version_data}Login Image:<br>'
     html_output += f'<img src="{login_sorted[0][0]}" alt="Login Image" style="max-width: 500px;">'
     html_output += '''
         <form action="/getmainScenePicture" method="post">
@@ -188,6 +189,9 @@ def query_short_id():
     URL = f'https://res.snakesvc.com/res-version/{fileName}'
     response = requests.get(URL)
 
+    if response.status_code == 404:
+        return '<h1 style="font-size: 24px;">Error Short_id</h1>'
+
     login = []
     
     # Open the zip file from the response content
@@ -220,7 +224,8 @@ def query_short_id():
     )
 
     # Construct HTML to display version information and login image
-    html_output = f'{version_data}Login Image:<br>'
+    html_output = f'<h1 style="font-size: 24px;">Query Specify {short_id}  Version</h1>'
+    html_output += f'{version_data}Login Image:<br>'
     html_output += f'<img src="{login_sorted[0][0]}" alt="Login Image" style="max-width: 500px;">'
     html_output += '''
         <form action="/getmainScenePicture" method="post">
