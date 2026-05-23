@@ -9,6 +9,7 @@ import struct
 import gc
 from threading import Lock  # 🚀 Memory threshold gatekeeper for low-RAM/Render environments
 from urllib.parse import quote
+from threading import Semaphore  # 🚀 改用 Semaphore 來做後端溫和排隊
 
 from PIL import Image
 import texture2ddecoder
@@ -23,6 +24,8 @@ ASSETS_URL = 'https://res.snakesvc.com/assets'
 mem_lock = Lock()
 CURRENT_CONCURRENT_DECODES = 0
 MAX_CONCURRENT_DECODES = 2  # Allows max 2 heavy raw decodes at a time, instantly tripping 503 for the rest to trigger front-end self-healing retries
+
+decode_semaphore = Semaphore(2)
 
 # ─────────────────────────────────────────────
 #  ASTC Decoding Tools
@@ -74,31 +77,26 @@ def astc_bytes_to_png_bytes(astc_data: bytes) -> bytes:
 
 @app.route('/proxy/astc')
 def proxy_astc():
-    global CURRENT_CONCURRENT_DECODES
     url = request.args.get('url', '').strip('\'"')
     if not url or not url.startswith('https://res.snakesvc.com/'):
         return 'Invalid URL', 400
 
-    # 🚀 Circuit breaker logic preventing simultaneous decodes from executing and crashing the process via OOM
-    with mem_lock:
-        if CURRENT_CONCURRENT_DECODES >= MAX_CONCURRENT_DECODES:
-            return 'Server Busy: Memory Protection Triggered', 503
-        CURRENT_CONCURRENT_DECODES += 1
-
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        png_bytes = astc_bytes_to_png_bytes(resp.content)
-        
-        # Immediate garbage collection cleanup right after decode success
-        gc.collect()
-        
-        return Response(png_bytes, mimetype='image/png')
-    except Exception as e:
-        return f'ASTC Conversion Failed: {e}', 500
-    finally:
-        with mem_lock:
-            CURRENT_CONCURRENT_DECODES = max(0, CURRENT_CONCURRENT_DECODES - 1)
+    # 🚀 核心改動：acquire() 會自動排隊。有空位才放行，沒空位就卡住瀏覽器請求，絕不回 503
+    with decode_semaphore:
+        try:
+            # 1. 下載圖片（這一步其實不吃記憶體和 CPU，可以放在鎖裡面或外面，放在裡面最安全）
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            
+            # 2. 執行高耗能解碼
+            png_bytes = astc_bytes_to_png_bytes(resp.content)
+            
+            # 3. 立即強制回收記憶體
+            gc.collect()
+            
+            return Response(png_bytes, mimetype='image/png')
+        except Exception as e:
+            return f'ASTC Conversion Failed: {e}', 500
 
 
 # ─────────────────────────────────────────────
