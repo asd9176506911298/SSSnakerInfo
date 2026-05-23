@@ -7,8 +7,7 @@ import re
 import os
 import struct
 import gc
-from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor  # 🚀 導入執行緒池
+from threading import Lock  # 🚀 Memory threshold gatekeeper for low-RAM/Render environments
 from urllib.parse import quote
 
 from PIL import Image
@@ -16,10 +15,14 @@ import texture2ddecoder
 
 app = Flask(__name__)
 
-# 建立一個全局的執行緒池，專門用來處理背景圖片高並發下載與解碼
-executor_pool = ThreadPoolExecutor(max_workers=4)
-
 ASSETS_URL = 'https://res.snakesvc.com/assets'
+
+# ─────────────────────────────────────────────
+#  Memory Protection Circuit Breaker
+# ─────────────────────────────────────────────
+mem_lock = Lock()
+CURRENT_CONCURRENT_DECODES = 0
+MAX_CONCURRENT_DECODES = 2  # Allows max 2 heavy raw decodes at a time, instantly tripping 503 for the rest to trigger front-end self-healing retries
 
 # ─────────────────────────────────────────────
 #  ASTC Decoding Tools
@@ -56,64 +59,50 @@ def astc_bytes_to_png_bytes(astc_data: bytes) -> bytes:
     img = Image.frombytes('RGBA', (width, height), raw_bgra, 'raw', 'BGRA')
     del raw_bgra
 
-    # 🚀 已經完全移除 MAX_SIZE 限制，這裡會輸出 100% 原始解析度的 PNG！
-
+    # 🚀 Requirement met: 0% compression applied. 100% full quality output stream
     buf = io.BytesIO()
-    # 這裡可以把 compress_level 改為 3 或 4（原本是 1）
-    # 因為不縮放了，原圖檔案會變大，稍微提升壓縮率可以幫你省下很多網路傳輸時間
-    img.save(buf, format='PNG', optimize=False, compress_level=3)
+    img.save(buf, format='PNG', optimize=False, compress_level=1)
     png_bytes = buf.getvalue()
     del img
     buf.close()
     return png_bytes
 
-# ─────────────────────────────────────────────
-#  Cache（加大快取到 128，避免大批圖時互相擠掉）
-# ─────────────────────────────────────────────
-
-@lru_cache(maxsize=128)
-def fetch_and_decode_cached(url: str) -> bytes:
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    png_bytes = astc_bytes_to_png_bytes(resp.content)
-    gc.collect()
-    return png_bytes
-
-
-def pre_decode_worker(url: str):
-    """背景執行緒任務：靜默下載解碼並直接塞入 lru_cache"""
-    try:
-        fetch_and_decode_cached(url)
-    except Exception as e:
-        print(f"[背景解碼失敗] {url}: {e}")
-
 
 # ─────────────────────────────────────────────
-#  Flask Route: ASTC → PNG Proxy
+#  Flask route: Instantly convert ASTC to PNG
 # ─────────────────────────────────────────────
 
 @app.route('/proxy/astc')
 def proxy_astc():
+    global CURRENT_CONCURRENT_DECODES
     url = request.args.get('url', '').strip('\'"')
+    if not url or not url.startswith('https://res.snakesvc.com/'):
+        return 'Invalid URL', 400
 
-    if not url or 'res.snakesvc.com' not in url:
-        return 'Invalid URL: Target domain not permitted', 400
+    # 🚀 Circuit breaker logic preventing simultaneous decodes from executing and crashing the process via OOM
+    with mem_lock:
+        if CURRENT_CONCURRENT_DECODES >= MAX_CONCURRENT_DECODES:
+            return 'Server Busy: Memory Protection Triggered', 503
+        CURRENT_CONCURRENT_DECODES += 1
 
     try:
-        png_bytes = fetch_and_decode_cached(url)
-        return Response(
-            png_bytes,
-            mimetype='image/png',
-            headers={'Cache-Control': 'public, max-age=3600'}
-        )
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        png_bytes = astc_bytes_to_png_bytes(resp.content)
+        
+        # Immediate garbage collection cleanup right after decode success
+        gc.collect()
+        
+        return Response(png_bytes, mimetype='image/png')
     except Exception as e:
-        print(f"[proxy_astc] Error: {e}")
         return f'ASTC Conversion Failed: {e}', 500
+    finally:
+        with mem_lock:
+            CURRENT_CONCURRENT_DECODES = max(0, CURRENT_CONCURRENT_DECODES - 1)
 
 
 # ─────────────────────────────────────────────
-#  Shared Asset Helpers
+#  Shared Helpers
 # ─────────────────────────────────────────────
 
 def fetch_res_json(url: str, filename: str) -> dict:
@@ -125,7 +114,7 @@ def fetch_res_json(url: str, filename: str) -> dict:
 
 
 def build_file_url(key: str, meta: dict) -> str:
-    md5 = meta['md5']
+    md5  = meta['md5']
     parts = key.rsplit('.', 1)
     image_name = f"{parts[0]}.{md5}.{parts[1]}"
     return f"{ASSETS_URL}/{image_name}"
@@ -197,7 +186,7 @@ def render_version_page(title: str, res: dict, short_id: str | None = None) -> s
 
 
 # ─────────────────────────────────────────────
-#  Application Endpoints
+#  Routes
 # ─────────────────────────────────────────────
 
 @app.route('/')
@@ -245,88 +234,62 @@ def getmainScenePicture():
     res = fetch_res_json(url, filename)
     scenes = get_main_scene_images(res)
 
-    # 🚀 【核心優化點 1】：後端一拿到清單，立刻丟給背景執行緒池同時開跑下載與解碼
-    astc_urls = [path for path, _ in scenes if path.endswith('.astc')]
-    for target_url in astc_urls:
-        executor_pool.submit(pre_decode_worker, target_url)
-
     html = """
     <h1 style="font-size:24px;">Main Scene Pictures</h1>
-    <p style="color:#2ecc71;">✓ 已啟動背景群體高並發解碼管道...</p>
+    <p style="color:#2980b9;">🚀 Full Throttle Mode: Zero front-end throttling with automatic infinite self-healing retries and memory protection.</p>
     <div style='display:flex;flex-wrap:wrap;' id='gallery'>
     """
 
     for path, _ in scenes:
         proxy_url = f"/proxy/astc?url={quote(path, safe='')}" if path.endswith('.astc') else path
         html += f"""
-        <div style='flex:1 1 200px;margin:5px;border:1px solid #ccc;text-align:center;
-                    min-height:150px;display:flex;align-items:center;justify-content:center;background:#f9f9f9;'>
+        <div style='flex:1 1 150px;margin:5px;border:1px solid #ddd;text-align:center;
+                    min-height:150px;display:flex;align-items:center;justify-content:center;background:#fafafa;'>
             <img data-src="{proxy_url}"
                  style="max-width:100%;max-height:200px;display:none;"
                  class="lazy-astc">
-            <span class="loader" style="font-size:12px;color:#999;">Waiting...</span>
+            <span class="loader" style="font-size:12px;color:#f39c12;">Decoding queue...</span>
         </div>
         """
 
-    # 🚀 【核心優化點 2】：前端 MAX_CONCURRENT 放寬到 8，配合後端快速消化圖片
+    # 🚀 Self-healing asynchronous loading script
     html += """
     </div>
     <script>
     (function() {
-        const MAX_CONCURRENT = 4;   // 解除 2 張限制，直接放大到 8 通道並行要圖！
-        const MAX_RETRY      = 3;   
-        const RETRY_DELAY_MS = 1500;
+        const RETRY_DELAY_MS = 1000; // Immediate 1-second interval cooldown before smashing back into the backend
 
-        const items = Array.from(document.querySelectorAll('.lazy-astc')).map(img => ({
-            img,
-            loader: img.nextElementSibling,
-            retries: 0
-        }));
+        const images = Array.from(document.querySelectorAll('.lazy-astc'));
 
-        let active = 0;
+        images.forEach(img => {
+            const loader = img.nextElementSibling;
+            let retryCount = 0;
 
-        function loadNext() {
-            if (items.length === 0) return;
-            while (active < MAX_CONCURRENT && items.length > 0) {
-                const item = items.shift();
-                const { img, loader } = item;
-
-                active++;
-                if (loader) loader.innerText = 'Processing...';
-
-                img.src = img.getAttribute('data-src');
+            function tryLoad() {
+                const baseSrc = img.getAttribute('data-src');
+                // Force cash busting parameter on failure retries to prevent client cache lockouts
+                const timestamp = retryCount > 0 ? ('&_t=' + Date.now()) : '';
+                
+                img.src = baseSrc + timestamp;
 
                 img.onload = () => {
                     img.style.display = 'block';
                     if (loader) loader.remove();
-                    active--;
-                    loadNext();
                 };
 
                 img.onerror = () => {
-                    active--;
-                    if (item.retries < MAX_RETRY) {
-                        item.retries++;
-                        if (loader) loader.innerText = `Retry ${item.retries}/${MAX_RETRY}...`;
-                        const base = img.getAttribute('data-src').split('&_t=')[0];
-                        img.setAttribute('data-src', base + '&_t=' + Date.now());
-                        setTimeout(() => {
-                            items.unshift(item);  
-                            loadNext();
-                        }, RETRY_DELAY_MS);
-                    } else {
-                        if (loader) {
-                            loader.innerText = 'Failed ✗';
-                            loader.style.color = '#c00';
-                        }
-                        loadNext();
+                    retryCount++;
+                    if (loader) {
+                        loader.innerText = `Waiting (Retry ${retryCount})...`;
+                        loader.style.color = '#e74c3c';
                     }
+                    setTimeout(tryLoad, RETRY_DELAY_MS);
                 };
             }
-        }
 
-        // 一口氣把 8 個並發通道填滿發射出去
-        loadNext();
+            // Fire all concurrent async asset loading routines immediately 
+            tryLoad();
+        });
     })();
     </script>
     """
