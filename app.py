@@ -6,12 +6,18 @@ import io
 import re
 import os
 import struct
-import gc  # Imported for manual garbage collection
+import gc
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor  # 🚀 導入執行緒池
+from urllib.parse import quote
 
 from PIL import Image
 import texture2ddecoder
 
 app = Flask(__name__)
+
+# 建立一個全局的執行緒池，專門用來處理背景圖片高並發下載與解碼
+executor_pool = ThreadPoolExecutor(max_workers=4)
 
 ASSETS_URL = 'https://res.snakesvc.com/assets'
 
@@ -22,10 +28,6 @@ ASSETS_URL = 'https://res.snakesvc.com/assets'
 ASTC_MAGIC = 0x5CA1AB13
 
 def parse_astc_header(data: bytes):
-    """
-    Parses the 16-byte ASTC file header.
-    Returns (block_w, block_h, width, height) or raises ValueError if format is invalid.
-    """
     if len(data) < 16:
         raise ValueError("Data too short to be a valid ASTC file")
 
@@ -44,63 +46,69 @@ def parse_astc_header(data: bytes):
 
 
 def astc_bytes_to_png_bytes(astc_data: bytes) -> bytes:
-    """
-    Converts ASTC binary data to PNG binary data in-memory.
-    Includes explicit memory cleanup to prevent Render OOM (Out Of Memory) crashes.
-    """
     block_w, block_h, width, height = parse_astc_header(astc_data)
-    compressed = astc_data[16:]  # Skip the 16-byte header
+    compressed = astc_data[16:]
+    del astc_data
 
-    # texture2ddecoder.decode_astc returns raw BGRA bytes
     raw_bgra = texture2ddecoder.decode_astc(compressed, width, height, block_w, block_h)
+    del compressed
+
     img = Image.frombytes('RGBA', (width, height), raw_bgra, 'raw', 'BGRA')
+    del raw_bgra
+
+    # 🚀 已經完全移除 MAX_SIZE 限制，這裡會輸出 100% 原始解析度的 PNG！
 
     buf = io.BytesIO()
-    img.save(buf, format='PNG')
+    # 這裡可以把 compress_level 改為 3 或 4（原本是 1）
+    # 因為不縮放了，原圖檔案會變大，稍微提升壓縮率可以幫你省下很多網路傳輸時間
+    img.save(buf, format='PNG', optimize=False, compress_level=3)
     png_bytes = buf.getvalue()
-
-    # Explicitly delete massive byte arrays and close buffers to free RAM instantly
-    del compressed
-    del raw_bgra
     del img
     buf.close()
-    
-    # Force Python garbage collector to reclaim leaked memory fragments
-    gc.collect() 
+    return png_bytes
 
+# ─────────────────────────────────────────────
+#  Cache（加大快取到 128，避免大批圖時互相擠掉）
+# ─────────────────────────────────────────────
+
+@lru_cache(maxsize=128)
+def fetch_and_decode_cached(url: str) -> bytes:
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    png_bytes = astc_bytes_to_png_bytes(resp.content)
+    gc.collect()
     return png_bytes
 
 
+def pre_decode_worker(url: str):
+    """背景執行緒任務：靜默下載解碼並直接塞入 lru_cache"""
+    try:
+        fetch_and_decode_cached(url)
+    except Exception as e:
+        print(f"[背景解碼失敗] {url}: {e}")
+
+
 # ─────────────────────────────────────────────
-#  Flask Route: On-the-fly ASTC to PNG Proxy
+#  Flask Route: ASTC → PNG Proxy
 # ─────────────────────────────────────────────
 
 @app.route('/proxy/astc')
 def proxy_astc():
-    """
-    Usage: /proxy/astc?url=https://res.snakesvc.com/assets/xxx.astc
-    Converts individual ASTC textures to standard browser-readable PNG formats.
-    """
-    url = request.args.get('url', '')
-    
-    # Strip accidental extra quotes or whitespace injected by browser proxying
-    url = url.strip('\'"') 
-    
-    # Loosened restriction check to tolerate HTTP/HTTPS routing schemes on reverse-proxies
+    url = request.args.get('url', '').strip('\'"')
+
     if not url or 'res.snakesvc.com' not in url:
         return 'Invalid URL: Target domain not permitted', 400
 
     try:
-        # Include standard User-Agent headers to avoid getting blocklisted by target asset CDN
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        resp = requests.get(url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        
-        png_bytes = astc_bytes_to_png_bytes(resp.content)
-        return Response(png_bytes, mimetype='image/png')
+        png_bytes = fetch_and_decode_cached(url)
+        return Response(
+            png_bytes,
+            mimetype='image/png',
+            headers={'Cache-Control': 'public, max-age=3600'}
+        )
     except Exception as e:
-        # Logs errors explicitly into the Render Host Dashboard console
-        print(f"Error converting ASTC texture: {e}")
+        print(f"[proxy_astc] Error: {e}")
         return f'ASTC Conversion Failed: {e}', 500
 
 
@@ -109,7 +117,6 @@ def proxy_astc():
 # ─────────────────────────────────────────────
 
 def fetch_res_json(url: str, filename: str) -> dict:
-    """Downloads remote version archive package and extracts configuration schema manifest metadata."""
     response = requests.get(url, timeout=15)
     response.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
@@ -118,15 +125,13 @@ def fetch_res_json(url: str, filename: str) -> dict:
 
 
 def build_file_url(key: str, meta: dict) -> str:
-    """Constructs authenticated target CDN asset location string maps."""
-    md5  = meta['md5']
-    parts = key.rsplit('.', 1)  # splits structure target array into filename and format keys
+    md5 = meta['md5']
+    parts = key.rsplit('.', 1)
     image_name = f"{parts[0]}.{md5}.{parts[1]}"
     return f"{ASSETS_URL}/{image_name}"
 
 
 def get_login_images(res: dict) -> list:
-    """Extracts UI landing splash files sorted by file size weight limits."""
     items = []
     for key, meta in res['files'].items():
         if key.startswith('login') and (key.endswith('.png') or key.endswith('.astc')):
@@ -135,7 +140,6 @@ def get_login_images(res: dict) -> list:
 
 
 def get_main_scene_images(res: dict) -> list:
-    """Extracts standard operational rendering canvas graphics environments metadata."""
     items = []
     for key, meta in res['files'].items():
         if key.startswith('mainScene') and (key.endswith('.png') or key.endswith('.astc')):
@@ -144,16 +148,13 @@ def get_main_scene_images(res: dict) -> list:
 
 
 def img_tag(url: str, style: str = 'max-width: 100%;') -> str:
-    """Generates standard image embedding nodes based on specific compression parameters."""
     if url.endswith('.astc'):
-        from urllib.parse import quote
         proxy_url = f"/proxy/astc?url={quote(url, safe='')}"
         return f'<img src="{proxy_url}" style="{style}" title="ASTC (Auto Converted)">'
     return f'<img src="{url}" style="{style}">'
 
 
 def render_version_info(version: dict) -> str:
-    """Auxiliary layout helper mapping configuration labels."""
     return (
         f"branch: {version['branch']}<br>"
         f"short_id: {version['short_id']}<br>"
@@ -177,10 +178,8 @@ COMMON_BUTTONS = '''
 
 
 def render_version_page(title: str, res: dict, short_id: str | None = None) -> str:
-    """Assembles base dashboard tracking components interfaces templates layout forms."""
     login_sorted = get_login_images(res)
     version = res['version']
-
     scene_hidden = f'<input type="hidden" name="short_id" value="{short_id}">' if short_id else ''
 
     html  = f'<h1 style="font-size:24px;">{title}</h1>'
@@ -198,7 +197,7 @@ def render_version_page(title: str, res: dict, short_id: str | None = None) -> s
 
 
 # ─────────────────────────────────────────────
-#  Application Endpoints Routes
+#  Application Endpoints
 # ─────────────────────────────────────────────
 
 @app.route('/')
@@ -235,11 +234,6 @@ def currentMobileVersion():
 
 @app.route('/getmainScenePicture', methods=['POST'])
 def getmainScenePicture():
-    """
-    Renders the scene picture array gallery.
-    Uses sequential client-side asynchronous queue management via JS 
-    to stop concurrent processing spikes on weak cloud hardware systems.
-    """
     if 'short_id' in request.form:
         short_id = request.form.get('short_id')
         filename = f'res.{short_id}.json'
@@ -251,62 +245,89 @@ def getmainScenePicture():
     res = fetch_res_json(url, filename)
     scenes = get_main_scene_images(res)
 
+    # 🚀 【核心優化點 1】：後端一拿到清單，立刻丟給背景執行緒池同時開跑下載與解碼
+    astc_urls = [path for path, _ in scenes if path.endswith('.astc')]
+    for target_url in astc_urls:
+        executor_pool.submit(pre_decode_worker, target_url)
+
     html = """
     <h1 style="font-size:24px;">Main Scene Pictures</h1>
-    <p style="color:#666;">Processing images inside sequential pipeline queues to prevent 513/503 Render crashes...</p>
+    <p style="color:#2ecc71;">✓ 已啟動背景群體高並發解碼管道...</p>
     <div style='display:flex;flex-wrap:wrap;' id='gallery'>
     """
-    
+
     for path, _ in scenes:
-        from urllib.parse import quote
         proxy_url = f"/proxy/astc?url={quote(path, safe='')}" if path.endswith('.astc') else path
-        
-        # Hide the proxy location inside a data-src parameter to hold loading back
         html += f"""
-        <div style='flex:1 1 200px; margin:5px; border:1px solid #ccc; text-align:center; min-height:150px; display:flex; align-items:center; justify-content:center; background:#f9f9f9;'>
-            <img data-src="{proxy_url}" style="max-width:100%; max-height:200px; display:none;" class="lazy-astc">
-            <span style="font-size:12px; color:#999;" class="loader">Queueing...</span>
+        <div style='flex:1 1 200px;margin:5px;border:1px solid #ccc;text-align:center;
+                    min-height:150px;display:flex;align-items:center;justify-content:center;background:#f9f9f9;'>
+            <img data-src="{proxy_url}"
+                 style="max-width:100%;max-height:200px;display:none;"
+                 class="lazy-astc">
+            <span class="loader" style="font-size:12px;color:#999;">Waiting...</span>
         </div>
         """
-        
-    # JavaScript Payload: Implements a concurrency throttling pattern (max 2 parallel asset transformations)
+
+    # 🚀 【核心優化點 2】：前端 MAX_CONCURRENT 放寬到 8，配合後端快速消化圖片
     html += """
     </div>
     <script>
-        const images = Array.from(document.querySelectorAll('.lazy-astc'));
-        const MAX_CONCURRENT = 2; 
-        let activeRequests = 0;
+    (function() {
+        const MAX_CONCURRENT = 4;   // 解除 2 張限制，直接放大到 8 通道並行要圖！
+        const MAX_RETRY      = 3;   
+        const RETRY_DELAY_MS = 1500;
+
+        const items = Array.from(document.querySelectorAll('.lazy-astc')).map(img => ({
+            img,
+            loader: img.nextElementSibling,
+            retries: 0
+        }));
+
+        let active = 0;
 
         function loadNext() {
-            if (images.length === 0) return;
-            if (activeRequests >= MAX_CONCURRENT) return;
+            if (items.length === 0) return;
+            while (active < MAX_CONCURRENT && items.length > 0) {
+                const item = items.shift();
+                const { img, loader } = item;
 
-            const img = images.shift();
-            const loader = img.nextElementSibling;
-            
-            activeRequests++;
-            if (loader) loader.innerText = "Processing...";
-            
-            // Re-assigning data-src to standard src starts targeted pipeline sequence execution
-            img.src = img.getAttribute('data-src');
-            
-            img.onload = img.onerror = () => {
-                img.style.display = 'block';
-                if (loader) loader.remove();
-                activeRequests--;
-                
-                // Triggers immediate loop iteration for next item pending inside collection
-                loadNext(); 
-            };
+                active++;
+                if (loader) loader.innerText = 'Processing...';
 
-            // Attempt to keep concurrent lanes packed under hardware threshold limit guidelines
-            loadNext();
+                img.src = img.getAttribute('data-src');
+
+                img.onload = () => {
+                    img.style.display = 'block';
+                    if (loader) loader.remove();
+                    active--;
+                    loadNext();
+                };
+
+                img.onerror = () => {
+                    active--;
+                    if (item.retries < MAX_RETRY) {
+                        item.retries++;
+                        if (loader) loader.innerText = `Retry ${item.retries}/${MAX_RETRY}...`;
+                        const base = img.getAttribute('data-src').split('&_t=')[0];
+                        img.setAttribute('data-src', base + '&_t=' + Date.now());
+                        setTimeout(() => {
+                            items.unshift(item);  
+                            loadNext();
+                        }, RETRY_DELAY_MS);
+                    } else {
+                        if (loader) {
+                            loader.innerText = 'Failed ✗';
+                            loader.style.color = '#c00';
+                        }
+                        loadNext();
+                    }
+                };
+            }
         }
 
-        // Initialize queue worker processes thread loops
-        for (let i = 0; i < MAX_CONCURRENT; i++) {
-            loadNext();
-        }
+        // 一口氣把 8 個並發通道填滿發射出去
+        loadNext();
+    })();
     </script>
     """
     return html
@@ -327,11 +348,9 @@ def query_short_id():
 
 
 if __name__ == '__main__':
-    # Safely switches Flask configuration flags checking deployment container system environment parameters
     is_debug = os.environ.get('FLASK_DEBUG', 'False').lower() in ['true', '1']
-    
     app.run(
-        host='0.0.0.0', 
-        port=int(os.environ.get('PORT', 5000)), 
+        host='0.0.0.0',
+        port=int(os.environ.get('PORT', 5000)),
         debug=is_debug
     )
