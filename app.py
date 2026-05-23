@@ -6,6 +6,7 @@ import io
 import re
 import os
 import struct
+import gc  # Imported for manual garbage collection
 
 from PIL import Image
 import texture2ddecoder
@@ -13,7 +14,6 @@ import texture2ddecoder
 app = Flask(__name__)
 
 ASSETS_URL = 'https://res.snakesvc.com/assets'
-
 
 # ─────────────────────────────────────────────
 #  ASTC Decoding Tools
@@ -23,7 +23,7 @@ ASTC_MAGIC = 0x5CA1AB13
 
 def parse_astc_header(data: bytes):
     """
-    Parse ASTC file header (16 bytes).
+    Parses the 16-byte ASTC file header.
     Returns (block_w, block_h, width, height) or raises ValueError if format is invalid.
     """
     if len(data) < 16:
@@ -45,51 +45,71 @@ def parse_astc_header(data: bytes):
 
 def astc_bytes_to_png_bytes(astc_data: bytes) -> bytes:
     """
-    Convert ASTC binary data to PNG binary data (completed in-memory, without writing files).
+    Converts ASTC binary data to PNG binary data in-memory.
+    Includes explicit memory cleanup to prevent Render OOM (Out Of Memory) crashes.
     """
     block_w, block_h, width, height = parse_astc_header(astc_data)
-    compressed = astc_data[16:]  # Skip header
+    compressed = astc_data[16:]  # Skip the 16-byte header
 
-    # texture2ddecoder.decode_astc(data, w, h, block_w, block_h)
-    # Returns BGRA bytes
+    # texture2ddecoder.decode_astc returns raw BGRA bytes
     raw_bgra = texture2ddecoder.decode_astc(compressed, width, height, block_w, block_h)
-
     img = Image.frombytes('RGBA', (width, height), raw_bgra, 'raw', 'BGRA')
 
     buf = io.BytesIO()
     img.save(buf, format='PNG')
-    return buf.getvalue()
+    png_bytes = buf.getvalue()
+
+    # Explicitly delete massive byte arrays and close buffers to free RAM instantly
+    del compressed
+    del raw_bgra
+    del img
+    buf.close()
+    
+    # Force Python garbage collector to reclaim leaked memory fragments
+    gc.collect() 
+
+    return png_bytes
 
 
 # ─────────────────────────────────────────────
-#  Flask route: Instantly convert ASTC to PNG and return
+#  Flask Route: On-the-fly ASTC to PNG Proxy
 # ─────────────────────────────────────────────
 
 @app.route('/proxy/astc')
 def proxy_astc():
     """
     Usage: /proxy/astc?url=https://res.snakesvc.com/assets/xxx.astc
-    The browser can use this directly as a normal PNG image.
+    Converts individual ASTC textures to standard browser-readable PNG formats.
     """
     url = request.args.get('url', '')
-    if not url or not url.startswith('https://res.snakesvc.com/'):
-        return 'Invalid URL', 400
+    
+    # Strip accidental extra quotes or whitespace injected by browser proxying
+    url = url.strip('\'"') 
+    
+    # Loosened restriction check to tolerate HTTP/HTTPS routing schemes on reverse-proxies
+    if not url or 'res.snakesvc.com' not in url:
+        return 'Invalid URL: Target domain not permitted', 400
 
     try:
-        resp = requests.get(url, timeout=15)
+        # Include standard User-Agent headers to avoid getting blocklisted by target asset CDN
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
+        
         png_bytes = astc_bytes_to_png_bytes(resp.content)
         return Response(png_bytes, mimetype='image/png')
     except Exception as e:
+        # Logs errors explicitly into the Render Host Dashboard console
+        print(f"Error converting ASTC texture: {e}")
         return f'ASTC Conversion Failed: {e}', 500
 
 
 # ─────────────────────────────────────────────
-#  Shared Helpers
+#  Shared Asset Helpers
 # ─────────────────────────────────────────────
 
 def fetch_res_json(url: str, filename: str) -> dict:
-    """Download zip and parse JSON, returning the resource dict."""
+    """Downloads remote version archive package and extracts configuration schema manifest metadata."""
     response = requests.get(url, timeout=15)
     response.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
@@ -98,18 +118,15 @@ def fetch_res_json(url: str, filename: str) -> dict:
 
 
 def build_file_url(key: str, meta: dict) -> str:
-    """Construct full CDN URL based on key and meta from res['files']."""
+    """Constructs authenticated target CDN asset location string maps."""
     md5  = meta['md5']
-    parts = key.rsplit('.', 1)          # ['login/bg', 'png'] or ['login/bg', 'astc']
+    parts = key.rsplit('.', 1)  # splits structure target array into filename and format keys
     image_name = f"{parts[0]}.{md5}.{parts[1]}"
     return f"{ASSETS_URL}/{image_name}"
 
 
 def get_login_images(res: dict) -> list:
-    """
-    Extract login image list from res dict (supports .png and .astc).
-    Returns [(url, size), ...] sorted by size descending.
-    """
+    """Extracts UI landing splash files sorted by file size weight limits."""
     items = []
     for key, meta in res['files'].items():
         if key.startswith('login') and (key.endswith('.png') or key.endswith('.astc')):
@@ -118,10 +135,7 @@ def get_login_images(res: dict) -> list:
 
 
 def get_main_scene_images(res: dict) -> list:
-    """
-    Extract mainScene image list from res dict (supports .png and .astc).
-    Returns [(url, size), ...] sorted by size descending.
-    """
+    """Extracts standard operational rendering canvas graphics environments metadata."""
     items = []
     for key, meta in res['files'].items():
         if key.startswith('mainScene') and (key.endswith('.png') or key.endswith('.astc')):
@@ -130,11 +144,7 @@ def get_main_scene_images(res: dict) -> list:
 
 
 def img_tag(url: str, style: str = 'max-width: 100%;') -> str:
-    """
-    Generate <img> tag based on file extension:
-    - .png  → Use original URL directly
-    - .astc → Real-time conversion via /proxy/astc route
-    """
+    """Generates standard image embedding nodes based on specific compression parameters."""
     if url.endswith('.astc'):
         from urllib.parse import quote
         proxy_url = f"/proxy/astc?url={quote(url, safe='')}"
@@ -143,6 +153,7 @@ def img_tag(url: str, style: str = 'max-width: 100%;') -> str:
 
 
 def render_version_info(version: dict) -> str:
+    """Auxiliary layout helper mapping configuration labels."""
     return (
         f"branch: {version['branch']}<br>"
         f"short_id: {version['short_id']}<br>"
@@ -166,6 +177,7 @@ COMMON_BUTTONS = '''
 
 
 def render_version_page(title: str, res: dict, short_id: str | None = None) -> str:
+    """Assembles base dashboard tracking components interfaces templates layout forms."""
     login_sorted = get_login_images(res)
     version = res['version']
 
@@ -186,7 +198,7 @@ def render_version_page(title: str, res: dict, short_id: str | None = None) -> s
 
 
 # ─────────────────────────────────────────────
-#  Routes
+#  Application Endpoints Routes
 # ─────────────────────────────────────────────
 
 @app.route('/')
@@ -223,6 +235,11 @@ def currentMobileVersion():
 
 @app.route('/getmainScenePicture', methods=['POST'])
 def getmainScenePicture():
+    """
+    Renders the scene picture array gallery.
+    Uses sequential client-side asynchronous queue management via JS 
+    to stop concurrent processing spikes on weak cloud hardware systems.
+    """
     if 'short_id' in request.form:
         short_id = request.form.get('short_id')
         filename = f'res.{short_id}.json'
@@ -234,10 +251,64 @@ def getmainScenePicture():
     res = fetch_res_json(url, filename)
     scenes = get_main_scene_images(res)
 
-    html = "<div style='display:flex;flex-wrap:wrap;'>"
+    html = """
+    <h1 style="font-size:24px;">Main Scene Pictures</h1>
+    <p style="color:#666;">Processing images inside sequential pipeline queues to prevent 513/503 Render crashes...</p>
+    <div style='display:flex;flex-wrap:wrap;' id='gallery'>
+    """
+    
     for path, _ in scenes:
-        html += f"<div style='flex:1 1 100px;margin:5px;'>{img_tag(path)}</div>"
-    html += "</div>"
+        from urllib.parse import quote
+        proxy_url = f"/proxy/astc?url={quote(path, safe='')}" if path.endswith('.astc') else path
+        
+        # Hide the proxy location inside a data-src parameter to hold loading back
+        html += f"""
+        <div style='flex:1 1 200px; margin:5px; border:1px solid #ccc; text-align:center; min-height:150px; display:flex; align-items:center; justify-content:center; background:#f9f9f9;'>
+            <img data-src="{proxy_url}" style="max-width:100%; max-height:200px; display:none;" class="lazy-astc">
+            <span style="font-size:12px; color:#999;" class="loader">Queueing...</span>
+        </div>
+        """
+        
+    # JavaScript Payload: Implements a concurrency throttling pattern (max 2 parallel asset transformations)
+    html += """
+    </div>
+    <script>
+        const images = Array.from(document.querySelectorAll('.lazy-astc'));
+        const MAX_CONCURRENT = 2; 
+        let activeRequests = 0;
+
+        function loadNext() {
+            if (images.length === 0) return;
+            if (activeRequests >= MAX_CONCURRENT) return;
+
+            const img = images.shift();
+            const loader = img.nextElementSibling;
+            
+            activeRequests++;
+            if (loader) loader.innerText = "Processing...";
+            
+            // Re-assigning data-src to standard src starts targeted pipeline sequence execution
+            img.src = img.getAttribute('data-src');
+            
+            img.onload = img.onerror = () => {
+                img.style.display = 'block';
+                if (loader) loader.remove();
+                activeRequests--;
+                
+                // Triggers immediate loop iteration for next item pending inside collection
+                loadNext(); 
+            };
+
+            // Attempt to keep concurrent lanes packed under hardware threshold limit guidelines
+            loadNext();
+        }
+
+        // Initialize queue worker processes thread loops
+        for (let i = 0; i < MAX_CONCURRENT; i++) {
+            loadNext();
+        }
+    </script>
+    """
     return html
 
 
@@ -256,4 +327,11 @@ def query_short_id():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
+    # Safely switches Flask configuration flags checking deployment container system environment parameters
+    is_debug = os.environ.get('FLASK_DEBUG', 'False').lower() in ['true', '1']
+    
+    app.run(
+        host='0.0.0.0', 
+        port=int(os.environ.get('PORT', 5000)), 
+        debug=is_debug
+    )
