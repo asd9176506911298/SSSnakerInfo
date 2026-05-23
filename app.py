@@ -22,7 +22,7 @@ ASSETS_URL = 'https://res.snakesvc.com/assets'
 # ─────────────────────────────────────────────
 mem_lock = Lock()
 CURRENT_CONCURRENT_DECODES = 0
-MAX_CONCURRENT_DECODES = 2  # Allows max 2 heavy raw decodes at a time, instantly tripping 503 for the rest to trigger front-end self-healing retries
+MAX_CONCURRENT_DECODES = 4  # Allows max 2 heavy raw decodes at a time, instantly tripping 503 for the rest to trigger front-end self-healing retries
 
 # ─────────────────────────────────────────────
 #  ASTC Decoding Tools
@@ -236,7 +236,7 @@ def getmainScenePicture():
 
     html = """
     <h1 style="font-size:24px;">Main Scene Pictures</h1>
-    <p style="color:#2980b9;">🚀 Full Throttle Mode: Zero front-end throttling with automatic infinite self-healing retries and memory protection.</p>
+    <p style="color:#2980b9;">🚀 Queue Mode: Controlled front-end concurrency to match server memory protection.</p>
     <div style='display:flex;flex-wrap:wrap;' id='gallery'>
     """
 
@@ -248,48 +248,61 @@ def getmainScenePicture():
             <img data-src="{proxy_url}"
                  style="max-width:100%;max-height:200px;display:none;"
                  class="lazy-astc">
-            <span class="loader" style="font-size:12px;color:#f39c12;">Decoding queue...</span>
+            <span class="loader" style="font-size:12px;color:#f39c12;">Waiting in queue...</span>
         </div>
         """
 
-    # 🚀 Self-healing asynchronous loading script
+    # 💡 修正後的前端排隊與指數退避重試腳本
     html += """
     </div>
     <script>
     (function() {
-        const RETRY_DELAY_MS = 1000; // Immediate 1-second interval cooldown before smashing back into the backend
-
+        const MAX_CONCURRENT_LOADS = 4; // 前端控制最多同時只發送 2 個請求，完美對接後端
         const images = Array.from(document.querySelectorAll('.lazy-astc'));
+        let currentIndex = 0;
+        let activeLoads = 0;
 
-        images.forEach(img => {
-            const loader = img.nextElementSibling;
-            let retryCount = 0;
-
-            function tryLoad() {
-                const baseSrc = img.getAttribute('data-src');
-                // Force cash busting parameter on failure retries to prevent client cache lockouts
-                const timestamp = retryCount > 0 ? ('&_t=' + Date.now()) : '';
-                
-                img.src = baseSrc + timestamp;
-
-                img.onload = () => {
-                    img.style.display = 'block';
-                    if (loader) loader.remove();
-                };
-
-                img.onerror = () => {
-                    retryCount++;
-                    if (loader) {
-                        loader.innerText = `Waiting (Retry ${retryCount})...`;
-                        loader.style.color = '#e74c3c';
-                    }
-                    setTimeout(tryLoad, RETRY_DELAY_MS);
-                };
+        function advanceQueue() {
+            while (activeLoads < MAX_CONCURRENT_LOADS && currentIndex < images.length) {
+                const img = images[currentIndex];
+                currentIndex++;
+                activeLoads++;
+                loadWithRetry(img, 0);
             }
+        }
 
-            // Fire all concurrent async asset loading routines immediately 
-            tryLoad();
-        });
+        function loadWithRetry(img, retryCount) {
+            const loader = img.nextElementSibling;
+            const baseSrc = img.getAttribute('data-src');
+            
+            // 如果失敗過，加上時間戳避免快取鎖死
+            const timestamp = retryCount > 0 ? ('&_t=' + Date.now()) : '';
+            img.src = baseSrc + timestamp;
+
+            img.onload = () => {
+                img.style.display = 'block';
+                if (loader) loader.remove();
+                activeLoads--;
+                advanceQueue(); // 這張好了，換下一張
+            };
+
+            img.onerror = () => {
+                const nextRetry = retryCount + 1;
+                if (loader) {
+                    loader.innerText = `Retry ${nextRetry} (Server Busy)...`;
+                    loader.style.color = '#e74c3c';
+                }
+                
+                // 指數退避延時（避免高頻率轟炸伺服器）：1秒、2秒、4秒... 最大 5 秒
+                const delay = Math.min(1000 * Math.pow(2, retryCount), 5000); 
+                setTimeout(() => {
+                    loadWithRetry(img, nextRetry);
+                }, delay);
+            };
+        }
+
+        // 啟動排隊機制
+        advanceQueue();
     })();
     </script>
     """
