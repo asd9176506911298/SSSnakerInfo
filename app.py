@@ -22,7 +22,7 @@ ASSETS_URL = 'https://res.snakesvc.com/assets'
 # ─────────────────────────────────────────────
 mem_lock = Lock()
 CURRENT_CONCURRENT_DECODES = 0
-MAX_CONCURRENT_DECODES = 3  # Allows max 2 heavy raw decodes at a time, instantly tripping 503 for the rest to trigger front-end self-healing retries
+MAX_CONCURRENT_DECODES = 2  # Allows max 2 heavy raw decodes at a time, instantly tripping 503 for the rest to trigger front-end self-healing retries
 
 # ─────────────────────────────────────────────
 #  ASTC Decoding Tools
@@ -257,7 +257,7 @@ def getmainScenePicture():
     </div>
     <script>
     (function() {
-        const MAX_CONCURRENT_LOADS = 3; // 前端控制最多同時只發送 2 個請求，完美對接後端
+        const MAX_CONCURRENT_LOADS = 2; // 前端控制最多同時只發送 2 個請求，完美對接後端
         const images = Array.from(document.querySelectorAll('.lazy-astc'));
         let currentIndex = 0;
         let activeLoads = 0;
